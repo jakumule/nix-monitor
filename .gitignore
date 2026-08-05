@@ -18,3 +18,5 @@ result-*
 
 # QML cache
 *.qmlc
+
+.claude/*.local.json

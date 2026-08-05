@@ -1,12 +1,12 @@
 {
-  "id": "nixMonitor",
-  "name": "Nix Monitor",
-  "description": "Monitor home-manager generations and Nix store disk usage with cleanup capabilities",
-  "version": "1.0.3",
-  "author": "Anton Andersson",
-  "icon": "inventory_2",
+  "id": "nixUpdateMonitor",
+  "name": "Nix Update Monitor",
+  "description": "Monitor nixpkgs/flake input updates for NixOS and flake-based Nix systems",
+  "version": "1.0.0",
+  "author": "JacquesHumule",
+  "icon": "ac_unit",
   "capabilities": ["dankbar-widget"],
-  "component": "./NixMonitor.qml",
-  "settings": "./NixMonitorSettings.qml",
+  "component": "./NixUpdateMonitor.qml",
+  "settings": "./NixUpdateMonitorSettings.qml",
   "permissions": ["settings_read", "settings_write"]
 }
