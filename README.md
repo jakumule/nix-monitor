@@ -1,6 +1,6 @@
 # Nix Update Monitor
 
-![](./assets/scrot.png)
+![](./assets/screenshot.png)
 
 A [DankMaterialShell](https://danklinux.com/) plugin for monitoring nixpkgs/flake input updates.
 
