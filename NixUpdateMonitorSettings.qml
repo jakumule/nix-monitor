@@ -1,7 +1,7 @@
 import QtQuick
 import qs.Common
 import qs.Modules.Plugins
-import qs.Widgets
+import qs.DCommon.Widgets
 
 PluginSettings {
     id: root
@@ -92,14 +92,31 @@ PluginSettings {
         visible: modeSetting.value === "flake"
     }
 
-    StringSetting {
-        settingKey: "flakeUpdateCommand"
-        label: "Flake Update Command"
-        description: "Run by the Update Flake Inputs button. Leave blank to auto-follow Flake Directory."
-        defaultValue: ""
-        placeholder: "cd <flake directory> && nix flake update"
+    ToggleSetting {
+        settingKey: "autoDiff"
+        label: "Compute Package Changes Automatically"
+        description: "Evaluate the flake with all inputs updated and diff it with dix against the running system - what an update + rebuild would change, even when flake.lock is current. Re-runs when upstream or the running system changes, or on Refresh (one evaluation, ~20-40 s of CPU)."
+        defaultValue: true
         visible: modeSetting.value === "flake"
     }
+
+    ToggleSetting {
+        settingKey: "checkSystem"
+        label: "Check Running System"
+        description: "Separately from the inputs, check whether /run/current-system is what the flake (working tree, uncommitted edits included) currently evaluates to - i.e. whether a rebuild is pending. One evaluation per check (~15 s). Re-checks automatically after a switch."
+        defaultValue: true
+        visible: modeSetting.value === "flake"
+    }
+
+    StringSetting {
+        settingKey: "flakeOutputAttr"
+        label: "Flake Output Attribute"
+        description: "Derivation diffed for package changes and compared against the running system. Leave blank for this host's NixOS system. Examples: homeConfigurations.me.activationPackage, darwinConfigurations.mac.system"
+        defaultValue: ""
+        placeholder: "nixosConfigurations.<hostname>.config.system.build.toplevel"
+        visible: modeSetting.value === "flake"
+    }
+
 
     SliderSetting {
         settingKey: "updateCheckInterval"

@@ -20,3 +20,6 @@ result-*
 *.qmlc
 
 .claude/*.local.json
+
+# devenv
+.devenv/
