@@ -2,7 +2,7 @@
   "id": "nixUpdateMonitor",
   "name": "Nix Update Monitor",
   "description": "Monitor nixpkgs/flake input updates for NixOS and flake-based Nix systems",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "JacquesHumule",
   "icon": "ac_unit",
   "capabilities": ["dankbar-widget"],

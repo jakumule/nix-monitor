@@ -108,6 +108,14 @@ PluginSettings {
         visible: modeSetting.value === "flake"
     }
 
+    ToggleSetting {
+        settingKey: "watchFiles"
+        label: "Watch for Changes"
+        description: "Use filesystem monitoring (inotify) to re-check as soon as something changes instead of waiting for the next scheduled check: a switch, flake.lock / flake.nix (inputs), or any other file in the flake directory (rebuild status and package changes). Upstream is still checked on the interval below. Needs inotifywait (inotify-tools); fetched with nix if missing."
+        defaultValue: true
+        visible: modeSetting.value === "flake"
+    }
+
     StringSetting {
         settingKey: "flakeOutputAttr"
         label: "Flake Output Attribute"
@@ -121,7 +129,7 @@ PluginSettings {
     SliderSetting {
         settingKey: "updateCheckInterval"
         label: "Update Check Interval"
-        description: "How often to check for nixpkgs updates"
+        description: "How often to check upstream for nixpkgs / flake input updates"
         defaultValue: 3600
         minimum: 300
         maximum: 86400

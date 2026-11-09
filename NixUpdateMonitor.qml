@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Common
@@ -18,6 +17,7 @@ PluginComponent {
     property string flakeOutputAttr: pluginData.flakeOutputAttr || ""
     property bool autoDiff: pluginData.autoDiff !== undefined ? pluginData.autoDiff : true
     property bool checkSystem: pluginData.checkSystem !== undefined ? pluginData.checkSystem : true
+    property bool watchFiles: pluginData.watchFiles !== undefined ? pluginData.watchFiles : true
 
     property string lastUpdate: ""
 
@@ -60,6 +60,16 @@ PluginComponent {
     property string lastSystemCheck: ""
     property string runningSystemPath: "" // last seen /run/current-system target
 
+    // Filesystem watchers (see watch-changes.sh): a switch and edits to the flake's working
+    // tree trigger the matching checks right away. "Ready" = inotify watches are in place;
+    // until then (or if a watcher can't run) the timers below are all there is.
+    property bool systemWatchReady: false
+    property bool flakeWatchReady: false
+    property bool flakeWatchRestart: false  // restart the watcher once it has exited
+    property bool systemWatchRestart: false
+    property bool pendingInputsChange: false // flake.lock / flake.nix changed (debounced)
+    property bool pendingTreeChange: false   // some other file in the flake changed (debounced)
+
     // Every setting - including commands - is sourced from pluginData: either the Settings UI,
     // or a DMS-native declarative plugin install (`programs.dank-material-shell.plugins.<id>.settings`
     // in a flake). There is no separate config file. Commands are plain shell-command strings
@@ -89,6 +99,10 @@ PluginComponent {
     // ---- Derived view state ------------------------------------------------------------
 
     readonly property bool isFlake: root.mode === "flake"
+    readonly property bool watchEnabled: root.isFlake && root.checkUpdates && root.watchFiles
+    // The same directory the checks use, as an argv (no shell quoting needed).
+    readonly property var flakeWatchCommand: [root.pluginDir + "/watch-changes.sh", "flake", root.flakeDirectory]
+    readonly property var systemWatchCommand: [root.pluginDir + "/watch-changes.sh", "system"]
     readonly property bool showOutdatedCount: root.isFlake && root.canCompareVersions && !root.isUpToDate && root.outdatedInputCount > 0
     readonly property bool hasPackageDiff: root.diffResult !== null && root.diffResult.status === "ok"
     readonly property var diffCounts: root.hasPackageDiff ? root.diffResult.counts : ({ upgraded: 0, downgraded: 0, added: 0, removed: 0 })
@@ -123,40 +137,97 @@ PluginComponent {
     readonly property var activeCounts: root.activeDiff ? root.activeDiff.counts : ({ upgraded: 0, downgraded: 0, added: 0, removed: 0 })
     readonly property int activeTotal: root.activeDiff ? root.activeDiff.packages.length : 0
 
-    // Dashboard state, driven by the popout: a stat tile narrows the list to one status
-    // ("" = all), sections can be collapsed, and the search filters by package name.
+    // Popout state: a filter chip narrows the package list to one status ("" = all) and the
+    // search filters by package name.
     readonly property var sectionOrder: ["upgraded", "added", "removed", "downgraded"]
     property string statusFilter: ""
-    property var collapsedSections: ({})
     property string packageSearch: ""
     property bool showAllInputs: false
-    readonly property int inputChipLimit: 4
+    readonly property int inputRowLimit: 3
+    readonly property int packageRowHeight: 30
+    // The popout is sized by its content, so the list is what has to give on a short screen
+    // (or when the inputs list is expanded): 3-10 rows out of what the rest leaves over.
+    readonly property int packageListMaxHeight: {
+        var extraInputs = root.showAllInputs ? Math.max(0, root.inputRows().length - root.inputRowLimit) : 0
+        var room = (root.parentScreen?.height ?? 1080) - 680 - extraInputs * 40
+        return Math.max(3, Math.min(10, Math.floor(room / root.packageRowHeight))) * root.packageRowHeight
+    }
 
-    // Flattened rows for the package list: a header row per non-empty section, followed by
-    // its packages unless the section is collapsed (searching always shows matches).
+    // "All" plus one chip per status that actually occurs in the diff. Kept to icon + count
+    // (status name in the tooltip) so the five of them fit on one row.
+    readonly property var filterChips: {
+        var chips = [{ label: "All " + root.activeTotal, value: "" }]
+        for (var i = 0; i < root.sectionOrder.length; i++) {
+            var status = root.sectionOrder[i]
+            var n = root.activeCounts[status] || 0
+            if (n > 0) chips.push({
+                label: String(n), value: status, icon: root.packageStatusIcon(status),
+                tooltip: status.charAt(0).toUpperCase() + status.slice(1)
+            })
+        }
+        return chips
+    }
+    // statusFilter, unless a newer diff no longer has any package of that status.
+    readonly property string activeFilter: (root.activeCounts[root.statusFilter] || 0) > 0 ? root.statusFilter : ""
+    readonly property int filterIndex: {
+        for (var i = 0; i < root.filterChips.length; i++)
+            if (root.filterChips[i].value === root.activeFilter) return i
+        return 0
+    }
+
+    // Rows of the package list: grouped by status (sectionOrder), by name within a status.
     readonly property var packageRows: {
         if (!root.activeDiff) return []
         var q = root.packageSearch.trim().toLowerCase()
         var rows = []
         for (var i = 0; i < root.sectionOrder.length; i++) {
             var status = root.sectionOrder[i]
-            if (root.statusFilter && root.statusFilter !== status) continue
+            if (root.activeFilter && root.activeFilter !== status) continue
             var pkgs = root.activeDiff.packages.filter(function(p) {
                 return p.status === status && (!q || p.name.toLowerCase().indexOf(q) !== -1)
             })
-            if (pkgs.length === 0) continue
-            var expanded = q !== "" || !root.collapsedSections[status]
-            rows.push({ kind: "header", status: status, count: pkgs.length, expanded: expanded })
-            if (!expanded) continue
+            pkgs.sort(function(a, b) { return a.name.localeCompare(b.name) })
             for (var j = 0; j < pkgs.length; j++)
-                rows.push({ kind: "package", status: status, name: pkgs[j].name, changes: pkgs[j].changes })
+                rows.push({ status: status, name: pkgs[j].name, changes: pkgs[j].changes })
         }
         return rows
+    }
+
+    // What the package-changes section shows in place of the list (see diffPanel).
+    readonly property var diffState: {
+        var dir = root.shortenHome(root.flakeDirectory)
+        if (root.inputsState === "error")
+            return { kind: "inputsError", icon: "error", color: Theme.error, isError: true,
+                     title: "Could not check flake inputs",
+                     text: "Make sure " + dir + " contains flake.nix and flake.lock." }
+        if (root.diffResult !== null && root.diffResult.status === "same")
+            return { kind: "same", icon: "check_circle", color: Theme.success, isError: false,
+                     title: "Nothing to update",
+                     text: "Your running system already matches the flake with the latest inputs." }
+        if (root.inputsState === "unknown" && root.diffResult === null && !root.isComputingDiff)
+            return { kind: "waiting", icon: "sync", color: Theme.info, isError: false,
+                     title: "Resolving inputs",
+                     text: "Resolving the latest revisions of your inputs." }
+        if (root.isComputingDiff)
+            return { kind: "computing", icon: "", color: Theme.surfaceVariantText, isError: false,
+                     title: "Computing changes...",
+                     text: "Evaluating the flake with the latest inputs and comparing it with the running system (~30 s)" }
+        if (root.diffError)
+            return { kind: "failed", icon: "error", color: Theme.error, isError: true,
+                     title: "Package diff failed", text: root.diffError }
+        if (root.diffResult !== null)
+            return { kind: "empty", icon: "tune", color: Theme.surfaceVariantText, isError: false,
+                     title: "No package changes",
+                     text: "Only build inputs or configuration differ - a rebuild still applies them." }
+        return { kind: "off", icon: "difference", color: Theme.surfaceVariantText, isError: false,
+                 title: "Package changes not computed", text: "Automatic diff is off in settings." }
     }
 
     Component.onCompleted: {
         console.info("Nix Update Monitor plugin loaded")
         refreshData()
+        Qt.callLater(root.restartFlakeWatch)
+        Qt.callLater(root.restartSystemWatch)
     }
 
     // pluginData isn't populated yet at Component.onCompleted - DMS loads it asynchronously
@@ -168,6 +239,14 @@ PluginComponent {
     // Results from one mode mean nothing in the other (e.g. a standard-mode "can compare" left
     // over from the default-settings check at startup would show "-1 inputs" in flake mode).
     onModeChanged: resetCheckState()
+
+    // Settings arrive together (see onPluginDataChanged): callLater folds them into one restart.
+    onWatchEnabledChanged: {
+        Qt.callLater(root.restartFlakeWatch)
+        Qt.callLater(root.restartSystemWatch)
+    }
+    onFlakeWatchCommandChanged: Qt.callLater(root.restartFlakeWatch)
+    onSystemWatchCommandChanged: Qt.callLater(root.restartSystemWatch) // pluginDir resolved late
 
     onSystemCheckEnabledChanged: {
         if (!root.systemCheckEnabled) {
@@ -249,9 +328,43 @@ PluginComponent {
     }
 
     // ---- Popout ------------------------------------------------------------------------
+    // One column sized by its content (PluginPopout follows its implicitHeight): a hero card
+    // with the verdict and the pipeline, then - flake mode - the outdated inputs and the
+    // package changes. States with nothing to list give a short popout.
 
     popoutWidth: 500
-    popoutHeight: root.isFlake ? 760 : 300
+
+    component SectionLabel: Item {
+        id: sectionLabel
+        property string title: ""
+        property string trailing: ""
+
+        width: parent ? parent.width : 0
+        height: 18
+
+        StyledText {
+            id: sectionTitleText
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: sectionLabel.title
+            font.pixelSize: Theme.fontSizeSmall
+            font.weight: Font.Bold
+            font.letterSpacing: 1
+            color: Theme.surfaceVariantText
+        }
+
+        StyledText {
+            anchors.left: sectionTitleText.right
+            anchors.leftMargin: Theme.spacingM
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            horizontalAlignment: Text.AlignRight
+            text: sectionLabel.trailing
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
+            elide: Text.ElideLeft
+        }
+    }
 
     popoutContent: Component {
         PopoutComponent {
@@ -270,103 +383,83 @@ PluginComponent {
                 }
             }
 
-            Item {
-                width: parent.width
-                implicitHeight: root.popoutHeight - popout.headerHeight - popout.detailsHeight - Theme.spacingXL
+            Column {
+                id: body
+                x: Theme.spacingXS
+                width: parent.width - Theme.spacingXS * 2
+                spacing: Theme.spacingM
+                bottomPadding: Theme.spacingXS
 
-                ColumnLayout {
-                    id: body
-                    anchors.fill: parent
-                    anchors.leftMargin: Theme.spacingXS
-                    anchors.rightMargin: Theme.spacingXS
-                    spacing: Theme.spacingM
+                readonly property bool pipeline: root.isFlake && root.checkUpdates
 
-                    readonly property bool pipeline: root.isFlake && root.checkUpdates
+                // ---- Hero: verdict, then the pipeline (flake) or the revisions (standard) ----
+                DCard {
+                    id: hero
+                    width: parent.width
+                    height: heroColumn.implicitHeight + pad * 2
+                    color: Theme.withAlpha(root.resultColor(), 0.12)
+                    border.color: Theme.withAlpha(root.resultColor(), 0.35)
 
-                    // ---- Status line ----
-                    Row {
-                        id: statusLine
-                        Layout.fillWidth: true
-                        spacing: Theme.spacingS
-
-                        Rectangle {
-                            width: 36
-                            height: 36
-                            radius: 18
-                            color: Theme.withAlpha(root.resultColor(), 0.16)
-                            anchors.verticalCenter: parent.verticalCenter
-
-                            // Static on purpose: the header's refresh button already spins
-                            // while a check runs.
-                            DIcon {
-                                anchors.centerIn: parent
-                                name: root.statusIcon()
-                                size: Theme.iconSize - 2
-                                color: root.resultColor()
-                                filled: true
-                            }
-                        }
-
-                        Column {
-                            width: parent.width - 36 - parent.spacing
-                            anchors.verticalCenter: parent.verticalCenter
-                            spacing: 0
-
-                            StyledText {
-                                width: parent.width
-                                text: root.statusTitle()
-                                font.pixelSize: Theme.fontSizeLarge
-                                font.weight: Font.Bold
-                                color: Theme.surfaceText
-                                elide: Text.ElideRight
-                            }
-
-                            StyledText {
-                                width: parent.width
-                                text: {
-                                    var where = root.isFlake ? root.shortenHome(root.flakeDirectory) : root.nixpkgsChannel
-                                    return root.lastUpdate ? (where + "  ·  checked " + root.lastUpdate) : where
-                                }
-                                font.pixelSize: Theme.fontSizeSmall
-                                color: Theme.surfaceVariantText
-                                elide: Text.ElideMiddle
-                            }
-                        }
-                    }
-
-                    // ---- Flake mode, checking off: centered message ----
                     Column {
-                        Layout.fillWidth: true
-                        topPadding: Theme.spacingXL
-                        spacing: Theme.spacingS
-                        visible: root.isFlake && !root.checkUpdates
-
-                        DIcon {
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            name: root.statusIcon()
-                            size: 56
-                            color: Theme.withAlpha(root.resultColor(), 0.8)
-                        }
-
-                        StyledText {
-                            width: parent.width
-                            horizontalAlignment: Text.AlignHCenter
-                            text: root.statusSubtitle()
-                            font.pixelSize: Theme.fontSizeMedium
-                            color: Theme.surfaceVariantText
-                            wrapMode: Text.WordWrap
-                        }
-                    }
-
-                    // ---- Standard mode: revisions ----
-                    DCard {
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 76
-                        visible: !root.isFlake && root.checkUpdates
+                        id: heroColumn
+                        width: parent.width
+                        spacing: Theme.spacingM
 
                         Row {
-                            anchors.centerIn: parent
+                            width: parent.width
+                            spacing: Theme.spacingS
+
+                            Rectangle {
+                                width: 36
+                                height: 36
+                                radius: 18
+                                color: Theme.withAlpha(root.resultColor(), 0.16)
+                                anchors.verticalCenter: parent.verticalCenter
+
+                                // Static on purpose: the header's refresh button already spins
+                                // while a check runs.
+                                DIcon {
+                                    anchors.centerIn: parent
+                                    name: root.statusIcon()
+                                    size: Theme.iconSize - 2
+                                    color: root.resultColor()
+                                    filled: true
+                                }
+                            }
+
+                            Column {
+                                width: parent.width - 36 - parent.spacing
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: 0
+
+                                StyledText {
+                                    width: parent.width
+                                    text: root.statusTitle()
+                                    font.pixelSize: Theme.fontSizeLarge
+                                    font.weight: Font.Bold
+                                    color: Theme.surfaceText
+                                    elide: Text.ElideRight
+                                }
+
+                                StyledText {
+                                    width: parent.width
+                                    text: {
+                                        if (!root.checkUpdates) return root.statusSubtitle()
+                                        var where = root.isFlake ? root.shortenHome(root.flakeDirectory) : root.nixpkgsChannel
+                                        return root.lastUpdate ? (where + "  ·  checked " + root.lastUpdate) : where
+                                    }
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceVariantText
+                                    elide: Text.ElideMiddle
+                                }
+                            }
+                        }
+
+                        // ---- Standard mode: revisions ----
+                        Row {
+                            anchors.horizontalCenter: parent.horizontalCenter
                             spacing: Theme.spacingXL
+                            visible: !root.isFlake && root.checkUpdates
 
                             Repeater {
                                 model: [
@@ -402,141 +495,209 @@ PluginComponent {
                                 }
                             }
                         }
-                    }
 
-                    // ---- Pipeline stepper: upstream → flake.lock → system ----
-                    Item {
-                        id: stepper
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 74
-                        visible: body.pipeline
+                        // ---- Pipeline stepper: upstream → flake.lock → system ----
+                        Item {
+                            id: stepper
+                            width: parent.width
+                            height: 62
+                            visible: body.pipeline
 
-                        readonly property int nodeWidth: 84
-                        readonly property int circle: 40
-                        readonly property int linkWidth: (width - nodeWidth * 3) / 2
+                            readonly property int nodeWidth: 84
+                            readonly property int circle: 40
+                            readonly property int linkWidth: (width - nodeWidth * 3) / 2
 
-                        Repeater {
-                            model: [
-                                { icon: "cloud", label: "Upstream" },
-                                { icon: "lock", label: "flake.lock" },
-                                { icon: "computer", label: "System" }
-                            ]
+                            Repeater {
+                                model: [
+                                    { icon: "cloud", label: "Upstream" },
+                                    { icon: "lock", label: "flake.lock" },
+                                    { icon: "computer", label: "System" }
+                                ]
 
-                            Column {
-                                required property var modelData
-                                required property int index
-                                x: index * (stepper.nodeWidth + stepper.linkWidth)
-                                width: stepper.nodeWidth
-                                spacing: Theme.spacingXS
+                                Column {
+                                    required property var modelData
+                                    required property int index
+                                    x: index * (stepper.nodeWidth + stepper.linkWidth)
+                                    width: stepper.nodeWidth
+                                    spacing: Theme.spacingXS
 
-                                Rectangle {
-                                    anchors.horizontalCenter: parent.horizontalCenter
-                                    width: stepper.circle
-                                    height: stepper.circle
-                                    radius: stepper.circle / 2
-                                    color: Theme.cardSurface
-                                    border.width: 1
-                                    border.color: Theme.outlineMedium
+                                    Rectangle {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        width: stepper.circle
+                                        height: stepper.circle
+                                        radius: stepper.circle / 2
+                                        color: Theme.cardSurface
+                                        border.width: 1
+                                        border.color: Theme.outlineMedium
 
-                                    DIcon {
-                                        anchors.centerIn: parent
-                                        name: modelData.icon
-                                        size: Theme.iconSize - 4
-                                        color: Theme.surfaceText
+                                        DIcon {
+                                            anchors.centerIn: parent
+                                            name: modelData.icon
+                                            size: Theme.iconSize - 4
+                                            color: Theme.surfaceText
+                                        }
+                                    }
+
+                                    StyledText {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        text: modelData.label
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        font.weight: Font.Medium
+                                        color: Theme.surfaceVariantText
                                     }
                                 }
+                            }
 
-                                StyledText {
-                                    anchors.horizontalCenter: parent.horizontalCenter
-                                    text: modelData.label
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    font.weight: Font.Medium
-                                    color: Theme.surfaceVariantText
+                            Repeater {
+                                model: ["inputs", "system"]
+
+                                Item {
+                                    id: link
+                                    required property string modelData
+                                    required property int index
+                                    readonly property string linkState: modelData === "system" ? root.systemState : root.inputsState
+                                    readonly property bool checking: modelData === "system" ? root.systemChecking : root.inputsChecking
+                                    readonly property color tint: root.stateColor(linkState, checking)
+
+                                    x: stepper.nodeWidth + index * (stepper.nodeWidth + stepper.linkWidth)
+                                    width: stepper.linkWidth
+                                    height: stepper.height
+
+                                    Rectangle {
+                                        x: Theme.spacingXS
+                                        y: stepper.circle / 2 - height / 2
+                                        width: parent.width - Theme.spacingXS * 2
+                                        height: 3
+                                        radius: 1.5
+                                        color: link.tint
+                                        opacity: link.linkState === "off" ? 0.35 : 1
+                                    }
+
+                                    Rectangle {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        y: stepper.circle / 2 - height / 2
+                                        width: 12
+                                        height: 12
+                                        radius: 6
+                                        color: link.tint
+                                    }
+
+                                    StyledText {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        y: stepper.circle / 2 + 12
+                                        width: parent.width
+                                        horizontalAlignment: Text.AlignHCenter
+                                        text: root.linkLabel(link.modelData)
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        font.weight: Font.Medium
+                                        color: link.linkState === "off" || link.linkState === "unknown" ? Theme.surfaceVariantText : link.tint
+                                        elide: Text.ElideRight
+                                    }
                                 }
                             }
                         }
 
-                        Repeater {
-                            model: ["inputs", "system"]
-
-                            Item {
-                                id: link
-                                required property string modelData
-                                required property int index
-                                readonly property string linkState: modelData === "system" ? root.systemState : root.inputsState
-                                readonly property bool checking: modelData === "system" ? root.systemChecking : root.inputsChecking
-                                readonly property color tint: root.stateColor(linkState, checking)
-
-                                x: stepper.nodeWidth + index * (stepper.nodeWidth + stepper.linkWidth)
-                                width: stepper.linkWidth
-                                height: stepper.height
-
-                                Rectangle {
-                                    x: Theme.spacingXS
-                                    y: stepper.circle / 2 - height / 2
-                                    width: parent.width - Theme.spacingXS * 2
-                                    height: 3
-                                    radius: 1.5
-                                    color: link.tint
-                                    opacity: link.linkState === "off" ? 0.35 : 1
-                                }
-
-                                Rectangle {
-                                    anchors.horizontalCenter: parent.horizontalCenter
-                                    y: stepper.circle / 2 - height / 2
-                                    width: 12
-                                    height: 12
-                                    radius: 6
-                                    color: link.tint
-                                }
-
-                                StyledText {
-                                    anchors.horizontalCenter: parent.horizontalCenter
-                                    y: stepper.circle / 2 + 12
-                                    width: parent.width
-                                    horizontalAlignment: Text.AlignHCenter
-                                    text: root.linkLabel(link.modelData)
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    font.weight: Font.Medium
-                                    color: link.linkState === "off" || link.linkState === "unknown" ? Theme.surfaceVariantText : link.tint
-                                    elide: Text.ElideRight
-                                }
-                            }
+                        // ---- Running system: generation and when it was switched to ----
+                        StyledText {
+                            width: parent.width
+                            horizontalAlignment: Text.AlignHCenter
+                            visible: body.pipeline && text !== ""
+                            text: root.systemGenerationText()
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.surfaceVariantText
+                            elide: Text.ElideRight
                         }
                     }
+                }
 
-                    // ---- Outdated inputs ----
-                    Flow {
-                        Layout.fillWidth: true
-                        spacing: Theme.spacingXS
-                        visible: body.pipeline && root.inputsState === "behind"
+                // ---- Outdated inputs ----
+                Column {
+                    width: parent.width
+                    spacing: Theme.spacingS
+                    visible: body.pipeline && root.inputsState === "behind"
+
+                    SectionLabel {
+                        title: "INPUTS"
+                        trailing: root.outdatedInputCount + " newer upstream"
+                    }
+
+                    Column {
+                        id: inputList
+                        width: parent.width
+                        spacing: 2
+
+                        readonly property var rows: root.inputRows()
+                        readonly property int hidden: rows.length - root.inputRowLimit
 
                         Repeater {
-                            model: {
-                                var rows = root.inputRows()
-                                return root.showAllInputs ? rows : rows.slice(0, root.inputChipLimit)
-                            }
+                            model: root.showAllInputs ? inputList.rows : inputList.rows.slice(0, root.inputRowLimit)
 
-                            DBadge {
+                            DListRow {
+                                id: inputRow
                                 required property var modelData
-                                color: Theme.chipSurface
-                                textColor: Theme.surfaceText
-                                text: modelData.name + (modelData.newDate ? "  " + root.formatAge(modelData.oldDate, modelData.newDate) : "")
-                                tooltipText: modelData.oldRev
-                                    ? (modelData.oldRev.slice(0, 7) + " → " + modelData.newRev.slice(0, 7)
-                                        + (modelData.newDate ? "  ·  " + Qt.formatDate(new Date(modelData.newDate * 1000), "d MMM yyyy") : ""))
-                                    : null
+                                required property int index
+
+                                width: inputList.width
+                                height: 38
+                                firstInGroup: index === 0
+                                lastInGroup: inputList.hidden <= 0 && index === inputList.rows.length - 1
+
+                                StyledText {
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: Theme.spacingM
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: Math.min(implicitWidth, parent.width * 0.42)
+                                    text: inputRow.modelData.name
+                                    font.pixelSize: Theme.fontSizeMedium
+                                    font.weight: Font.Medium
+                                    color: Theme.surfaceText
+                                    elide: Text.ElideRight
+                                }
+
+                                Row {
+                                    anchors.right: parent.right
+                                    anchors.rightMargin: Theme.spacingM
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: Theme.spacingS
+
+                                    StyledText {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        visible: !!inputRow.modelData.oldRev
+                                        text: visible
+                                            ? inputRow.modelData.oldRev.slice(0, 7) + " → " + (inputRow.modelData.newRev || "?").slice(0, 7)
+                                            : ""
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        font.family: "monospace"
+                                        color: Theme.surfaceVariantText
+                                    }
+
+                                    DBadge {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        visible: text !== ""
+                                        color: Theme.chipSurface
+                                        textColor: Theme.surfaceText
+                                        text: root.formatAge(inputRow.modelData.oldDate, inputRow.modelData.newDate)
+                                        tooltipText: inputRow.modelData.newDate
+                                            ? "Upstream: " + Qt.formatDate(new Date(inputRow.modelData.newDate * 1000), "d MMM yyyy")
+                                            : null
+                                    }
+                                }
                             }
                         }
 
-                        DBadge {
-                            readonly property int hidden: root.inputRows().length - root.inputChipLimit
-                            visible: hidden > 0
-                            color: "transparent"
-                            border.width: 1
-                            border.color: Theme.outlineMedium
-                            textColor: Theme.primary
-                            text: root.showAllInputs ? "show less" : "+" + hidden + " more"
+                        DListRow {
+                            width: inputList.width
+                            height: 34
+                            visible: inputList.hidden > 0
+                            firstInGroup: false
+
+                            StyledText {
+                                anchors.centerIn: parent
+                                text: root.showAllInputs ? "Show less" : "Show " + inputList.hidden + " more"
+                                font.pixelSize: Theme.fontSizeSmall
+                                font.weight: Font.Medium
+                                color: Theme.primary
+                            }
 
                             MouseArea {
                                 anchors.fill: parent
@@ -545,143 +706,41 @@ PluginComponent {
                             }
                         }
                     }
+                }
 
-                    // ---- Running system → updated flake ----
-                    Loader {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        active: body.pipeline
-                        visible: active
-                        sourceComponent: diffPanel
-                    }
+                // ---- Running system → updated flake ----
+                Loader {
+                    width: parent.width
+                    active: body.pipeline
+                    visible: active
+                    sourceComponent: diffPanel
                 }
             }
         }
     }
 
-    // The package diff: running system → flake with updated inputs. A message/card while it's
-    // computing, failed, empty or off; otherwise stat tiles + searchable package list.
+    // The package diff: running system → flake with updated inputs. One state card while it's
+    // computing, failed, empty or off; otherwise filter chips + searchable package list.
     Component {
         id: diffPanel
 
-        ColumnLayout {
+        Column {
             id: dp
             spacing: Theme.spacingS
 
             readonly property bool showList: root.activeDiff !== null && root.activeTotal > 0
-            readonly property bool same: root.diffResult !== null && root.diffResult.status === "same"
-            readonly property bool waitingForInputs: root.inputsState === "unknown" && root.diffResult === null && !root.isComputingDiff
+            readonly property var info: root.diffState
 
-            // ---- Section label ----
-            Item {
-                Layout.fillWidth: true
-                Layout.preferredHeight: 18
-
-                StyledText {
-                    anchors.left: parent.left
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: root.inputsState === "behind" ? "IF YOU UPDATE & REBUILD" : "IF YOU REBUILD"
-                    font.pixelSize: Theme.fontSizeSmall
-                    font.weight: Font.Bold
-                    font.letterSpacing: 1
-                    color: Theme.surfaceVariantText
-                }
-
-                StyledText {
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: root.baselineText()
-                    font.pixelSize: Theme.fontSizeSmall
-                    color: Theme.surfaceVariantText
-                    elide: Text.ElideLeft
-                }
+            SectionLabel {
+                title: "PACKAGE CHANGES"
+                trailing: root.baselineText()
             }
 
-            // ---- Nothing would change ----
-            Column {
-                Layout.fillWidth: true
-                visible: dp.same || dp.waitingForInputs || root.inputsState === "error"
-                topPadding: Theme.spacingL
-                spacing: Theme.spacingS
-
-                DIcon {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    name: root.inputsState === "error" ? "error" : dp.same ? "check_circle" : "sync"
-                    size: 48
-                    color: Theme.withAlpha(root.inputsState === "error" ? Theme.error : dp.same ? Theme.success : Theme.info, 0.8)
-                }
-
-                StyledText {
-                    width: parent.width
-                    horizontalAlignment: Text.AlignHCenter
-                    text: root.inputsState === "error"
-                        ? "Could not check flake inputs. Make sure " + root.shortenHome(root.flakeDirectory) + " contains flake.nix and flake.lock."
-                        : dp.same ? "Nothing to update: your running system already matches the flake with the latest inputs."
-                        : "Resolving the latest revisions of your inputs."
-                    font.pixelSize: Theme.fontSizeMedium
-                    color: root.inputsState === "error" ? Theme.error : Theme.surfaceVariantText
-                    wrapMode: Text.WordWrap
-                }
-            }
-
-            // ---- Stat tiles ----
-            Row {
-                id: tiles
-                Layout.fillWidth: true
-                Layout.preferredHeight: 76
-                spacing: Theme.spacingS
-                visible: dp.showList
-
-                Repeater {
-                    model: [
-                        { status: "upgraded", label: "upgraded" },
-                        { status: "added", label: "added" },
-                        { status: "removed", label: "removed" },
-                        { status: "downgraded", label: "downgraded" }
-                    ]
-
-                    DCard {
-                        id: tile
-                        required property var modelData
-                        readonly property int count: root.activeCounts[modelData.status] || 0
-                        readonly property bool selected: root.statusFilter === modelData.status
-
-                        width: (tiles.width - tiles.spacing * 3) / 4
-                        height: tiles.height
-                        pad: Theme.spacingXS
-                        clickable: true
-                        interactive: count > 0
-                        tone: selected ? "primary" : ""
-                        onClicked: root.statusFilter = selected ? "" : modelData.status
-
-                        Column {
-                            anchors.centerIn: parent
-                            spacing: 0
-
-                            StyledText {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                text: tile.count
-                                font.pixelSize: Theme.fontSizeXLarge + 4
-                                font.weight: Font.Bold
-                                color: tile.tinted ? tile.contentColor : root.packageStatusColor(tile.modelData.status)
-                            }
-
-                            StyledText {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                text: tile.modelData.label
-                                font.pixelSize: Theme.fontSizeSmall
-                                color: tile.tinted ? tile.contentColor : Theme.surfaceVariantText
-                            }
-                        }
-                    }
-                }
-            }
-
-            // ---- Computing / failed / off / config-only ----
+            // ---- Computing / failed / nothing to do / off ----
             DCard {
-                Layout.fillWidth: true
-                Layout.preferredHeight: 76
-                visible: !dp.showList && !dp.same && !dp.waitingForInputs && root.inputsState !== "error"
+                width: parent.width
+                height: 76
+                visible: !dp.showList
 
                 Row {
                     anchors.fill: parent
@@ -696,15 +755,15 @@ PluginComponent {
                         DLoadingIndicator {
                             anchors.centerIn: parent
                             size: 40
-                            visible: root.isComputingDiff
+                            visible: dp.info.kind === "computing"
                         }
 
                         DIcon {
                             anchors.centerIn: parent
-                            visible: !root.isComputingDiff
-                            name: root.diffError ? "error" : (root.diffResult ? "tune" : "difference")
+                            visible: dp.info.kind !== "computing"
+                            name: dp.info.icon
                             size: Theme.iconSizeLarge
-                            color: root.diffError ? Theme.error : Theme.surfaceVariantText
+                            color: dp.info.color
                         }
                     }
 
@@ -714,10 +773,7 @@ PluginComponent {
 
                         StyledText {
                             width: parent.width
-                            text: root.isComputingDiff ? "Computing changes..."
-                                : root.diffError ? "Package diff failed"
-                                : root.diffResult ? "No package changes"
-                                : "Package changes not computed"
+                            text: dp.info.title
                             font.pixelSize: Theme.fontSizeMedium
                             font.weight: Font.Medium
                             color: Theme.surfaceText
@@ -726,12 +782,9 @@ PluginComponent {
 
                         StyledText {
                             width: parent.width
-                            text: root.isComputingDiff ? "Evaluating the flake with the latest inputs and comparing it with the running system (~30 s)"
-                                : root.diffError ? root.diffError
-                                : root.diffResult ? "Only build inputs or configuration differ - a rebuild still applies them."
-                                : "Automatic diff is off in settings."
+                            text: dp.info.text
                             font.pixelSize: Theme.fontSizeSmall
-                            color: root.diffError ? Theme.error : Theme.surfaceVariantText
+                            color: dp.info.isError ? Theme.error : Theme.surfaceVariantText
                             wrapMode: Text.WordWrap
                             maximumLineCount: 2
                             elide: Text.ElideRight
@@ -741,17 +794,35 @@ PluginComponent {
                     DButton {
                         id: diffAction
                         anchors.verticalCenter: parent.verticalCenter
-                        visible: !root.isComputingDiff && root.diffResult === null
-                        text: root.diffError ? "Retry" : "Compute"
-                        iconName: root.diffError ? "refresh" : "difference"
+                        visible: dp.info.kind === "failed" || dp.info.kind === "off"
+                        text: dp.info.kind === "failed" ? "Retry" : "Compute"
+                        iconName: dp.info.kind === "failed" ? "refresh" : "difference"
                         onClicked: root.computeDiff(true)
                     }
                 }
             }
 
+            // ---- Filter by kind of change ----
+            DFilterChips {
+                id: chips
+                width: parent.width
+                visible: dp.showList
+                model: root.filterChips
+                showCheck: false // keep the status icon on the selected chip
+                onSelectionChanged: index => root.statusFilter = root.filterChips[index].value
+
+                // The chips assign currentIndex themselves on click; this keeps it following
+                // statusFilter when the diff (and so the set of chips) changes.
+                Binding {
+                    target: chips
+                    property: "currentIndex"
+                    value: root.filterIndex
+                }
+            }
+
             // ---- Search ----
             DSearchField {
-                Layout.fillWidth: true
+                width: parent.width
                 visible: dp.showList
                 placeholderText: "Search " + root.activeTotal + " packages"
                 text: root.packageSearch
@@ -760,8 +831,9 @@ PluginComponent {
 
             // ---- Package list ----
             StyledRect {
-                Layout.fillWidth: true
-                Layout.fillHeight: true
+                width: parent.width
+                height: (packageList.count === 0 ? 56 : Math.min(packageList.count * root.packageRowHeight, root.packageListMaxHeight))
+                    + Theme.spacingXS * 2
                 visible: dp.showList
                 radius: Theme.cornerRadius
                 color: Theme.cardSurface
@@ -781,10 +853,9 @@ PluginComponent {
                     delegate: Item {
                         id: row
                         required property var modelData
-                        readonly property bool isHeader: modelData.kind === "header"
 
                         width: packageList.width
-                        height: isHeader ? 36 : 30
+                        height: root.packageRowHeight
 
                         Rectangle {
                             anchors.fill: parent
@@ -792,51 +863,36 @@ PluginComponent {
                             color: rowArea.containsMouse ? Theme.surfaceTextHover : "transparent"
                         }
 
-                        Row {
+                        DIcon {
+                            id: rowIcon
                             anchors.left: parent.left
-                            anchors.leftMargin: Theme.spacingXS
+                            anchors.leftMargin: Theme.spacingS
                             anchors.verticalCenter: parent.verticalCenter
-                            spacing: Theme.spacingXS
-                            visible: row.isHeader
-
-                            DIcon {
-                                name: row.modelData.expanded ? "expand_more" : "chevron_right"
-                                size: Theme.iconSizeSmall + 2
-                                color: Theme.surfaceVariantText
-                                anchors.verticalCenter: parent.verticalCenter
-                            }
-
-                            StyledText {
-                                text: row.isHeader ? root.sectionTitle(row.modelData.status) + "  ·  " + row.modelData.count : ""
-                                font.pixelSize: Theme.fontSizeMedium
-                                font.weight: Font.Bold
-                                color: root.packageStatusColor(row.modelData.status)
-                                anchors.verticalCenter: parent.verticalCenter
-                            }
+                            name: root.packageStatusIcon(row.modelData.status)
+                            size: Theme.iconSizeSmall
+                            color: root.packageStatusColor(row.modelData.status)
                         }
 
                         StyledText {
                             id: rowName
-                            visible: !row.isHeader
-                            anchors.left: parent.left
-                            anchors.leftMargin: Theme.spacingL + Theme.spacingS
+                            anchors.left: rowIcon.right
+                            anchors.leftMargin: Theme.spacingS
                             anchors.verticalCenter: parent.verticalCenter
                             width: Math.min(implicitWidth, parent.width * 0.45)
-                            text: row.isHeader ? "" : row.modelData.name
+                            text: row.modelData.name
                             font.pixelSize: Theme.fontSizeMedium
                             color: Theme.surfaceText
                             elide: Text.ElideRight
                         }
 
                         StyledText {
-                            visible: !row.isHeader
                             anchors.left: rowName.right
                             anchors.leftMargin: Theme.spacingM
                             anchors.right: parent.right
                             anchors.rightMargin: Theme.spacingS
                             anchors.verticalCenter: parent.verticalCenter
                             horizontalAlignment: Text.AlignRight
-                            text: row.isHeader ? "" : root.describeChanges(row.modelData.changes)
+                            text: root.describeChanges(row.modelData.changes)
                             font.pixelSize: Theme.fontSizeSmall
                             font.family: "monospace"
                             color: Theme.surfaceVariantText
@@ -847,8 +903,7 @@ PluginComponent {
                             id: rowArea
                             anchors.fill: parent
                             hoverEnabled: true
-                            cursorShape: row.isHeader ? Qt.PointingHandCursor : Qt.ArrowCursor
-                            onClicked: if (row.isHeader) root.toggleSection(row.modelData.status)
+                            acceptedButtons: Qt.NoButton
                         }
                     }
                 }
@@ -864,9 +919,9 @@ PluginComponent {
 
             // ---- Footer ----
             Item {
-                Layout.fillWidth: true
-                Layout.preferredHeight: 20
-                visible: dp.showList || dp.same
+                width: parent.width
+                height: 20
+                visible: dp.showList || dp.info.kind === "same"
 
                 StyledText {
                     anchors.left: parent.left
@@ -898,12 +953,6 @@ PluginComponent {
                     }
                 }
             }
-
-            // Keeps content at the top when there's no list to fill the space.
-            Item {
-                Layout.fillHeight: true
-                visible: !dp.showList
-            }
         }
     }
 
@@ -918,13 +967,78 @@ PluginComponent {
     }
 
     // Cheap poll of /run/current-system so a switch is picked up within seconds instead of at
-    // the next scheduled check.
+    // the next scheduled check. Only a fallback: it stops while the watcher below is in place.
     Timer {
         interval: 15000
-        running: root.isFlake && root.checkUpdates
+        running: root.isFlake && root.checkUpdates && !root.systemWatchReady
         repeat: true
         triggeredOnStart: true
-        onTriggered: if (!currentSystemProcess.running) currentSystemProcess.running = true
+        onTriggered: root.readRunningSystem()
+    }
+
+    // Watches /run/current-system being replaced (a switch). Started/restarted by
+    // restartSystemWatch(); if it exits by itself it is not respawned - the poll above takes
+    // over until the watch settings change.
+    Process {
+        id: systemWatchProcess
+        command: root.systemWatchCommand
+        running: false
+
+        stdout: SplitParser {
+            onRead: function(line) { root.readRunningSystem() }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                if (line.indexOf("Watches established") < 0) return
+                root.systemWatchReady = true
+                root.readRunningSystem() // catch a switch that happened while starting up
+            }
+        }
+        onExited: function(exitCode, exitStatus) {
+            var wasReady = root.systemWatchReady
+            root.systemWatchReady = false
+            if (root.systemWatchRestart) {
+                root.systemWatchRestart = false
+                if (root.watchEnabled) systemWatchProcess.running = true
+            } else if (root.watchEnabled && !wasReady) {
+                console.warn("Nix Update Monitor: system watcher failed (exit code " + exitCode + "), polling instead")
+            }
+        }
+    }
+
+    // Watches the flake's working tree. Started/restarted by restartFlakeWatch().
+    Process {
+        id: flakeWatchProcess
+        command: root.flakeWatchCommand
+        running: false
+
+        stdout: SplitParser {
+            onRead: function(line) { root.onFlakeFileChanged(line) }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                if (line.indexOf("Watches established") >= 0) root.flakeWatchReady = true
+            }
+        }
+        onExited: function(exitCode, exitStatus) {
+            var wasReady = root.flakeWatchReady
+            root.flakeWatchReady = false
+            if (root.flakeWatchRestart) {
+                root.flakeWatchRestart = false
+                if (root.watchEnabled) flakeWatchProcess.running = true
+            } else if (root.watchEnabled && !wasReady) {
+                console.warn("Nix Update Monitor: could not watch " + root.flakeDirectory
+                    + " (exit code " + exitCode + "), relying on scheduled checks")
+            }
+        }
+    }
+
+    // An editor save or a `nix flake update` is a burst of events (temp file, rename, several
+    // files...): wait for it to settle, then run each affected check once.
+    Timer {
+        id: flakeChangeTimer
+        interval: 3000
+        onTriggered: root.applyFlakeChanges()
     }
 
     Process {
@@ -942,6 +1056,11 @@ PluginComponent {
                 if (previous) root.checkSystemNow() // switched: re-check the rebuild status
                 root.maybeAutoDiff()                // first value, or the diff's baseline moved
             }
+        }
+
+        onExited: function(exitCode, exitStatus) {
+            // The link was replaced again while this was reading it.
+            if (root.runningSystemReadPending) root.readRunningSystem()
         }
     }
 
@@ -1113,7 +1232,8 @@ PluginComponent {
             // A newer set of input revisions arrived while this one was evaluating.
             var queued = root.queuedDiffKey
             root.queuedDiffKey = ""
-            if (queued && queued !== finishedKey) {
+            // (Or the same key, forced: the flake's files changed while this was evaluating.)
+            if (queued) {
                 root.startDiff(queued)
             } else {
                 root.isComputingDiff = false
@@ -1122,6 +1242,68 @@ PluginComponent {
     }
 
     // ---- Logic -------------------------------------------------------------------------
+
+    property bool runningSystemReadPending: false
+
+    function readRunningSystem() {
+        if (currentSystemProcess.running) {
+            root.runningSystemReadPending = true
+            return
+        }
+        root.runningSystemReadPending = false
+        currentSystemProcess.running = true
+    }
+
+    // (Re)starts the flake-tree watcher so it follows flakeDirectory and the watch settings.
+    // A running one has to exit first; its onExited then starts the new one.
+    function restartFlakeWatch() {
+        flakeChangeTimer.stop()
+        root.pendingInputsChange = false
+        root.pendingTreeChange = false
+        if (flakeWatchProcess.running) {
+            root.flakeWatchRestart = root.watchEnabled
+            flakeWatchProcess.running = false
+        } else if (root.watchEnabled) {
+            flakeWatchProcess.running = true
+        }
+    }
+
+    function restartSystemWatch() {
+        if (systemWatchProcess.running) {
+            root.systemWatchRestart = root.watchEnabled
+            systemWatchProcess.running = false
+        } else if (root.watchEnabled) {
+            systemWatchProcess.running = true
+        }
+    }
+
+    function onFlakeFileChanged(path) {
+        var name = path.substring(path.lastIndexOf("/") + 1)
+        if (!name) return
+        if (name === "flake.lock" || name === "flake.nix") root.pendingInputsChange = true
+        // flake.lock alone doesn't change what "updated inputs + rebuild" evaluates to.
+        if (name !== "flake.lock") root.pendingTreeChange = true
+        flakeChangeTimer.restart()
+    }
+
+    function applyFlakeChanges() {
+        var inputs = root.pendingInputsChange
+        var tree = root.pendingTreeChange
+        root.pendingInputsChange = false
+        root.pendingTreeChange = false
+        if (!root.watchEnabled) return
+        // Local edits don't show up in the diff key, so the diff has to be forced.
+        if (tree) root.forceDiff = true
+        if (inputs) {
+            // Locked revisions (or the inputs themselves) changed: full round, which also
+            // re-checks the system and ends in maybeAutoDiff().
+            root.checkForUpdates()
+        } else if (tree) {
+            // Config edit only: nothing upstream to ask about, so no network round.
+            root.checkSystemNow()
+            root.maybeAutoDiff()
+        }
+    }
 
     function refreshData() {
         if (root.checkUpdates) {
@@ -1374,19 +1556,6 @@ PluginComponent {
         return parts.join("  ·  ")
     }
 
-    // "26.11.20261103.1d06008" from a system store path; falls back to the hash when both
-    // sides have the same version (a config-only change).
-    function storeLabel(path, other) {
-        var name = path.split("/").pop()
-        var hash = name.slice(0, 7)
-        var m = name.match(/-(\d+\.\d+[^-]*)$/)
-        var version = m ? m[1] : name.slice(33)
-        var otherName = other ? other.split("/").pop() : ""
-        var om = otherName.match(/-(\d+\.\d+[^-]*)$/)
-        if (om && m && om[1] === m[1]) return hash + "…  " + version
-        return version
-    }
-
     // Right side of the diff panel's label: what the diff is measured against.
     function baselineText() {
         var d = root.diffResult
@@ -1395,16 +1564,6 @@ PluginComponent {
         var r = root.systemResult
         return r && r.generation !== null && r.generation !== undefined
             ? "vs running system · gen " + r.generation : "vs running system"
-    }
-
-    function sectionTitle(status) {
-        return status.charAt(0).toUpperCase() + status.slice(1)
-    }
-
-    function toggleSection(status) {
-        var next = Object.assign({}, root.collapsedSections)
-        next[status] = !next[status]
-        root.collapsedSections = next
     }
 
     function packageStatusIcon(status) {

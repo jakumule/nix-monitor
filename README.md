@@ -22,11 +22,30 @@ running system**, and shows one package diff across the whole of it:
 - **Upstream → flake.lock** - inputs with newer upstream revisions (`check-flake-updates.sh`)
 - **flake.lock → System** - whether `/run/current-system` is exactly what the flake (working
   tree, uncommitted edits included) evaluates to (`check-system-sync.sh`). Re-checked
-  automatically within ~15 s of a switch. Only applies to `nixosConfigurations` outputs; can be
+  automatically right after a switch, and when a file in the flake directory changes. Only applies to `nixosConfigurations` outputs; can be
   turned off with `checkSystem = false`
 - **Package diff** - running system → the flake with fully updated inputs, i.e. what
   `nix flake update` + rebuild would change (`diff-flake-update.sh`). Computed even when
   `flake.lock` is already current, so a pending rebuild shows up too
+
+### Flake mode: checks follow the filesystem
+Upstream can only be polled (`updateCheckInterval`), but everything local is watched with
+inotify (`watch-changes.sh`), so the widget reacts within a few seconds instead of at the next
+scheduled check:
+
+| What changed | What re-runs |
+|---|---|
+| `/run/current-system` (a switch) | rebuild status, package diff |
+| `flake.lock` (e.g. `nix flake update`) | input check, rebuild status |
+| `flake.nix` | input check, rebuild status, package diff |
+| any other file in the flake directory | rebuild status, package diff (no network) |
+
+Changes are debounced (3 s) so a save or an update counts once. `.git`, `.jj`, `.direnv` and
+`result*` links are ignored, as are editor swap/backup files - which means a file that only becomes *tracked* (`git add`, a jj
+snapshot) is not noticed by itself; hit Refresh, or it is picked up with the next change. If
+`inotifywait` can't run (or the directory can't be watched) the plugin logs a warning and falls
+back to the timers: the scheduled check plus a 15 s poll of `/run/current-system`. Turn it off
+with `watchFiles = false`.
 
 ### Bar Widget Display
 - Update status - Check icon shows update status for the active mode:
@@ -37,13 +56,19 @@ running system**, and shows one package diff across the whole of it:
   (→ ⟲) when the running system is behind the flake (red if that check failed)
 
 ### Detailed Popout Panel
-Click the widget to open a detailed view with:
-- Status line - overall state, the flake directory or channel, and when it was last checked
-- Standard mode - local vs. remote nixpkgs revision
-- Flake mode dashboard:
-  - **Pipeline** - upstream → flake.lock → system, each link colored by its state
-  - **Inputs** - a chip per outdated input showing how much newer upstream is; hover for the locked → upstream revision
-  - **If you update & rebuild** - stat tiles (upgraded / added / removed / downgraded; click one to show only that kind) and a searchable package list grouped into collapsible sections, measured against the running system (labelled with its generation)
+Click the widget to open a detailed view. The panel is sized by its content, so it stays small
+when there is nothing to list:
+- **Status card** - overall state (tinted green / yellow / red), the flake directory or channel,
+  and when it was last checked
+  - Standard mode - local vs. remote nixpkgs revision
+  - Flake mode - the **pipeline** upstream → flake.lock → system, each link colored by its
+    state, and the running system's generation and when it was switched to
+- Flake mode sections:
+  - **Inputs** - a row per outdated input: locked → upstream revision and how much newer
+    upstream is (hover for the upstream commit date)
+  - **Package changes** - what updating and rebuilding would change, measured against the
+    running system (labelled with its generation): filter chips (all / upgraded / added /
+    removed / downgraded, with counts), a search field and the package list
 - Refresh button (header) - re-run all checks and recompute the package diff
 
 ### Configurable Settings
@@ -53,6 +78,7 @@ including commands - see "Configuration" below:
 - Monitor mode - Standard or Flake
 - NixOS channel selection (unstable, 25.11, 25.05, 24.11) - standard mode
 - Flake directory and output attribute - flake mode
+- Watch for changes (filesystem monitoring) - flake mode
 - Update check interval (300-86400 seconds)
 - Revision-check commands
 
@@ -234,7 +260,7 @@ Nix-pinned):
   remoteRevisionCommand =
     "${pkgs.curl}/bin/curl -s https://api.github.com/repos/NixOS/nixpkgs/git/ref/heads/nixos-unstable 2>/dev/null | ${pkgs.jq}/bin/jq -r '.object.sha' 2>/dev/null | cut -c 1-7 || echo 'N/A'";
   ```
-- `flakeUpdateCheckCommand` - flake-mode input check. `settings`-only, no UI field (the bundled `check-flake-updates.sh` is always used unless you override this declaratively). Default: `<plugin dir>/check-flake-updates.sh <flakeDirectory>`. Must print JSON `{"count": <number>, "inputs": [<names>]}` (`count: -1` signals an error/unknown state). It can also print `"details": [{"name", "oldRev", "newRev", "oldDate", "newDate"}]` (dates in unix seconds); the Inputs tab uses these, and they decide when the package diff re-runs.
+- `flakeUpdateCheckCommand` - flake-mode input check. `settings`-only, no UI field (the bundled `check-flake-updates.sh` is always used unless you override this declaratively). Default: `<plugin dir>/check-flake-updates.sh <flakeDirectory>`. Must print JSON `{"count": <number>, "inputs": [<names>]}` (`count: -1` signals an error/unknown state). It can also print `"details": [{"name", "oldRev", "newRev", "oldDate", "newDate"}]` (dates in unix seconds); the Inputs section uses these, and they decide when the package diff re-runs.
 - `diffCommand` - flake-mode package diff. `settings`-only, no UI field. Default: `<plugin dir>/diff-flake-update.sh <flakeDirectory> <flakeOutputAttr> [<current system path>]`. Must print one JSON object: `{"status": "error", "message": "..."}`, `{"status": "same"}`, or `{"status": "ok", "packages": [{"name", "status": "upgraded|downgraded|added|removed", "changes": [{"old", "new"}]}], "counts": {...}, "paths": {"old", "new"}, "sizeOld", "sizeNew"}` (see the header of `diff-flake-update.sh`).
 
 
@@ -244,6 +270,8 @@ Nix-pinned):
 - `mode` (`"standard"` | `"flake"`, default `"standard"`)
 - `nixpkgsChannel` (default `"nixos-unstable"`, standard mode only)
 - `flakeDirectory` (default `"/etc/nixos"`, flake mode only)
+- `checkSystem` (bool, default `true`, flake mode only) - check whether the running system is what the flake evaluates to
+- `watchFiles` (bool, default `true`, flake mode only) - re-check on filesystem changes (a switch, edits in `flakeDirectory`) instead of only on the interval
 - `autoDiff` (bool, default `true`, flake mode only) - compute the dix package diff (running system → updated flake) automatically
 - `flakeOutputAttr` (default `""` = `nixosConfigurations.<hostname>.config.system.build.toplevel`, flake mode only) - what the dix package diff evaluates
 
@@ -253,6 +281,7 @@ Nix-pinned):
 - Nix package manager
 - `jq` - only needed for flake mode; auto-fetched via `nix run nixpkgs#jq` if not already on `PATH` (adds first-run latency and a dependency on the `nixpkgs` flake registry entry - install it normally, e.g. via `home.packages`, to avoid both)
 - `dix` - only needed for the flake-mode package diff; auto-fetched via `nix run nixpkgs#dix` if not on `PATH`, same as `jq`. Needs dix 3.x (the `dix diff` subcommand)
+- `inotifywait` (inotify-tools) - only needed for flake-mode file watching (`watchFiles`); auto-fetched via `nix shell nixpkgs#inotify-tools` if not on `PATH`. Linux only - elsewhere the plugin falls back to its timers
 - `git` (for standard-mode update checking, and because flake mode requires `flakeDirectory` to already be a git-tracked flake source, same as `nixos-rebuild --flake` does)
 
 ## License
